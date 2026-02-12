@@ -1,303 +1,462 @@
 import os
 from flask import Flask, render_template, redirect, url_for, request, flash, session, send_from_directory
 from flask_sqlalchemy import SQLAlchemy
-from werkzeug.security import generate_password_hash, check_password_hash
 from werkzeug.utils import secure_filename
 from functools import wraps
-import hashlib
 from dotenv import load_dotenv
-
 load_dotenv()
+import os
+import redis
+import smtplib
+from email.message import EmailMessage
+from email.mime.text import MIMEText
+import random
+EMAIL_USER = os.getenv("EMAIL_USER")
+EMAIL_PASS = os.getenv("EMAIL_PASS")
+EMAIL_FROM = os.getenv("EMAIL_FROM")
 
+REDIS_SERVER_NUMBER = os.getenv("REDIS_SERVER_NUMBER")
+REDIS_PORT_NUMBER = int(os.getenv("REDIS_PORT_NUMBER"))
+REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
+
+redis_client = redis.Redis(
+    host=REDIS_SERVER_NUMBER,
+    port=REDIS_PORT_NUMBER,
+    password=REDIS_PASSWORD,
+    decode_responses=True
+)
+# ---------------- APP ----------------
 app = Flask(__name__)
+app.config["SECRET_KEY"] = "super-secret-key"
+app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///data.db"
+app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
 
-# Set a securely generated secret key for production
-app.config['SECRET_KEY'] = os.urandom(24)  # For production, consider setting this securely
-app.config['SQLALCHEMY_DATABASE_URI'] = 'sqlite:///users.db'
-app.config['SQLALCHEMY_TRACK_MODIFICATIONS'] = False
+UPLOAD_FOLDER = "uploads"
+ALLOWED_EXTENSIONS = {"txt", "pdf", "png", "jpg", "jpeg", "gif"}
+app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
 
-# File upload configuration
-UPLOAD_FOLDER = 'uploads'
-ALLOWED_EXTENSIONS = {'txt', 'pdf', 'png', 'jpg', 'jpeg', 'gif'}
-app.config['UPLOAD_FOLDER'] = UPLOAD_FOLDER
-
-# Create uploads folder if it doesn't exist
 if not os.path.exists(UPLOAD_FOLDER):
     os.makedirs(UPLOAD_FOLDER)
 
 db = SQLAlchemy(app)
 
-# Models
-class User(db.Model):
-    id = db.Column(db.Integer, primary_key=True)
-    username = db.Column(db.String(120), unique=True, nullable=False)
-    password = db.Column(db.String(200), nullable=False)
-    links = db.relationship('Link', backref='user', lazy=True)
-    files = db.relationship('FileUpload', backref='user', lazy=True)
+# ---------------- ADMIN CREDENTIALS ----------------
+ADMIN_USERNAME = "admin"
+ADMIN_PASSWORD = "admin123"
 
+# ---------------- MODELS ----------------
 class Link(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(120), nullable=False)
     url = db.Column(db.String(300), nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
 class FileUpload(db.Model):
     id = db.Column(db.Integer, primary_key=True)
     title = db.Column(db.String(120), nullable=False)
     filename = db.Column(db.String(300), nullable=False)
-    user_id = db.Column(db.Integer, db.ForeignKey('user.id'), nullable=False)
 
-# Helpers
+class Collaborator(db.Model):
+    id = db.Column(db.Integer, primary_key=True)
+    name = db.Column(db.String(120), nullable=False)
+    email = db.Column(db.String(120), nullable=False)
+    resume_url = db.Column(db.String(300), nullable=False)
+    contribution = db.Column(db.String(300), nullable=False)
+
+# ---------------- HELPERS ----------------
 def allowed_file(filename):
-    """Check if the file has an allowed extension."""
-    return '.' in filename and filename.rsplit('.', 1)[1].lower() in ALLOWED_EXTENSIONS
+    return "." in filename and filename.rsplit(".", 1)[1].lower() in ALLOWED_EXTENSIONS
 
-def login_required(f):
-    """Custom decorator to require login for specific routes."""
+def admin_required(f):
     @wraps(f)
-    def decorated_function(*args, **kwargs):
-        if 'user_id' not in session:
-            flash('Please login first.', 'danger')
-            return redirect(url_for('login'))
+    def decorated(*args, **kwargs):
+        if not session.get("is_admin"):
+            flash("Admin access only", "danger")
+            return redirect(url_for("admin_login"))
         return f(*args, **kwargs)
-    return decorated_function
+    return decorated
 
-# Routes
-@app.route('/admin')
+# ---------------- HOME ----------------
+@app.route("/")
 def home():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
-    return redirect(url_for('login'))
+    return redirect(url_for("resources"))
 
-@app.route('/login', methods=['GET', 'POST'])
-def login():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
+# ---------------- ADMIN AUTH ----------------
+@app.route("/admin-entry")
+def admin_entry():
+    if session.get("is_admin"):
+        session.pop("is_admin")
+        flash("Logged out", "info")
+        return redirect(url_for("resources"))
+    else:
+        return redirect(url_for("admin_login"))
+@app.route("/admin-login", methods=["GET", "POST"])
+def admin_login():
+    if session.get("is_admin"):
+        return redirect(url_for("dashboard"))
 
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
-        user = User.query.filter_by(username=username).first()
-        if user and check_password_hash(user.password, password):
-            session['user_id'] = user.id
-            flash('Login successful!', 'success')
-            return redirect(url_for('dashboard'))
+    if request.method == "POST":
+        if (
+            request.form["username"] == ADMIN_USERNAME and
+            request.form["password"] == ADMIN_PASSWORD
+        ):
+            session["is_admin"] = True
+            flash("Login successful", "success")
+            return redirect(url_for("dashboard"))
         else:
-            flash('Invalid username or password.', 'danger')
+            flash("Invalid credentials", "danger")
 
-    return render_template('login.html')
+    return render_template("admin_login.html")
 
-@app.route('/register', methods=['GET', 'POST'])
-def register():
-    if 'user_id' in session:
-        return redirect(url_for('dashboard'))
+@app.route("/admin-logout")
+def admin_logout():
+    session.pop("is_admin", None)
+    flash("Logged out", "info")
+    return redirect(url_for("resources"))
 
-    if request.method == 'POST':
-        username = request.form['username']
-        password = request.form['password']
+# ---------------- PUBLIC RESOURCES ----------------
+@app.route("/resources")
+def resources():
+    links = Link.query.all()
+    files = FileUpload.query.all()
+    return render_template("resources.html", links=links, files=files)
 
-        if User.query.filter_by(username=username).first():
-            flash('Username already exists. Please choose another.', 'danger')
-            return redirect(url_for('register'))
-
-        hashed_password = generate_password_hash(password)
-        new_user = User(username=username, password=hashed_password)
-        db.session.add(new_user)
-        db.session.commit()
-        flash('Registration successful! Please log in.', 'success')
-        return redirect(url_for('login'))
-
-    return render_template('register.html')
-
-@app.route('/dashboard')
-@login_required
+# ---------------- DASHBOARD ----------------
+@app.route("/dashboard")
+@admin_required
 def dashboard():
-    user = User.query.get(session['user_id'])
-    links = user.links
-    files = user.files
-    return render_template('dashboard.html', links=links, files=files)
+    links = Link.query.all()
+    files = FileUpload.query.all()
+    return render_template("dashboard.html", links=links, files=files)
 
-import validators
-
-@app.route('/add-link', methods=['GET', 'POST'])
-@login_required
+# ---------------- LINKS ----------------
+@app.route("/add-link", methods=["GET","POST"])
+@admin_required
 def add_link():
-    if request.method == 'POST':
-        title = request.form['title']
-        url_link = request.form['url']
-
-        # Check for empty fields
-        if not title or not url_link:
-            flash('Please provide both title and link.', 'danger')
-            return redirect(url_for('add_link'))
-
-        # Validate URL format
-        if not validators.url(url_link):
-            flash('Please provide a valid URL (e.g., https://example.com).', 'danger')
-            return redirect(url_for('add_link'))
-
-        new_link = Link(title=title, url=url_link, user_id=session['user_id'])
-        db.session.add(new_link)
+    if request.method == "POST":
+        db.session.add(Link(
+            title=request.form["title"],
+            url=request.form["url"]
+        ))
         db.session.commit()
-        flash('Link added successfully!', 'success')
-        return redirect(url_for('dashboard'))
+        flash("Link added", "success")
+        return redirect(url_for("dashboard"))
+    return render_template("add_link.html")
 
-    return render_template('add_link.html')
+@app.route("/edit-link/<int:id>", methods=["GET","POST"])
+@admin_required
+def edit_link(id):
+    link = Link.query.get_or_404(id)
 
-@app.route('/add-file', methods=['GET', 'POST'])
-@login_required
-def add_file():
-    if request.method == 'POST':
-        title = request.form['title']
-        file = request.files.get('file')
-
-        if not title or not file:
-            flash('Please provide both title and file.', 'danger')
-            return redirect(url_for('add_file'))
-
-        if not allowed_file(file.filename):
-            flash(f'File type not allowed. Allowed types: {ALLOWED_EXTENSIONS}', 'danger')
-            return redirect(url_for('add_file'))
-
-        filename = secure_filename(file.filename)
-        filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-
-        # Avoid filename collisions by appending number if needed
-        counter = 1
-        base, ext = os.path.splitext(filename)
-        while os.path.exists(filepath):
-            filename = f"{base}_{counter}{ext}"
-            filepath = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-            counter += 1
-
-        file.save(filepath)
-
-        new_file = FileUpload(title=title, filename=filename, user_id=session['user_id'])
-        db.session.add(new_file)
+    if request.method == "POST":
+        link.title = request.form["title"]
+        link.url = request.form["url"]
         db.session.commit()
-        flash('File uploaded successfully!', 'success')
-        return redirect(url_for('dashboard'))
+        flash("Link updated", "success")
+        return redirect(url_for("dashboard"))
 
-    return render_template('add_file.html')
+    return render_template("edit_link.html", link=link)\
 
-@app.route('/download/<int:file_id>')
-@login_required
-def download(file_id):
-    file_record = FileUpload.query.get_or_404(file_id)
-    if file_record.user_id != session['user_id']:
-        flash('You do not have permission to download this file.', 'danger')
-        return redirect(url_for('dashboard'))
-
-    return send_from_directory(app.config['UPLOAD_FOLDER'], file_record.filename, as_attachment=True)
-
-@app.route('/edit-link/<int:link_id>', methods=['GET', 'POST'])
-@login_required
-def edit_link(link_id):
-    link = Link.query.get_or_404(link_id)
-    
-    # Ensure the logged-in user owns this link
-    if link.user_id != session['user_id']:
-        flash('You do not have permission to edit this link.', 'danger')
-        return redirect(url_for('dashboard'))
-
-    if request.method == 'POST':
-        link.title = request.form['title']
-        link.url = request.form['url']
-        db.session.commit()
-        flash('Link updated successfully!', 'success')
-        return redirect(url_for('dashboard'))
-
-    return render_template('edit_link.html', link=link)
-
-@app.route('/edit-file/<int:file_id>', methods=['GET', 'POST'])
-@login_required
-def edit_file(file_id):
-    file_record = FileUpload.query.get_or_404(file_id)
-
-    # Ensure the logged-in user owns this file
-    if file_record.user_id != session['user_id']:
-        flash('You do not have permission to edit this file.', 'danger')
-        return redirect(url_for('dashboard'))
-
-    if request.method == 'POST':
-        file_record.title = request.form['title']
-        db.session.commit()
-        flash('File updated successfully!', 'success')
-        return redirect(url_for('dashboard'))
-
-    return render_template('edit_file.html', file=file_record)
-
-@app.route('/delete-link/<int:link_id>')
-@login_required
-def delete_link(link_id):
-    link = Link.query.get_or_404(link_id)
-    if link.user_id != session['user_id']:
-        flash('You cannot delete this link.', 'danger')
-        return redirect(url_for('dashboard'))
+@app.route("/delete-link/<int:id>", methods=["POST"])
+@admin_required
+def delete_link(id):
+    link = Link.query.get_or_404(id)
     db.session.delete(link)
     db.session.commit()
-    flash('Link deleted successfully.', 'success')
-    return redirect(url_for('dashboard'))
+    flash("Link deleted", "success")
+    return redirect(url_for("dashboard"))
 
-@app.route('/delete-file/<int:file_id>')
-@login_required
-def delete_file(file_id):
-    file = FileUpload.query.get_or_404(file_id)
-    if file.user_id != session['user_id']:
-        flash('You cannot delete this file.', 'danger')
-        return redirect(url_for('dashboard'))
-    
-    # Delete file from server
-    file_path = os.path.join(app.config['UPLOAD_FOLDER'], file.filename)
-    if os.path.exists(file_path):
-        os.remove(file_path)
-    
-    db.session.delete(file)
+# ---------------- FILES ----------------
+@app.route("/add-file", methods=["GET","POST"])
+@admin_required
+def add_file():
+    if request.method == "POST":
+        file = request.files["file"]
+
+        if not allowed_file(file.filename):
+            flash("Invalid file type", "danger")
+            return redirect(url_for("add_file"))
+
+        filename = secure_filename(file.filename)
+        file.save(os.path.join(UPLOAD_FOLDER, filename))
+
+        db.session.add(FileUpload(
+            title=request.form["title"],
+            filename=filename
+        ))
+        db.session.commit()
+
+        flash("File uploaded", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template("add_file.html")
+@app.route("/edit-file/<int:id>", methods=["GET", "POST"])
+@admin_required
+def edit_file(id):
+    file = FileUpload.query.get_or_404(id)
+
+    if request.method == "POST":
+        file.title = request.form["title"]
+        db.session.commit()
+        flash("File updated", "success")
+        return redirect(url_for("dashboard"))
+
+    return render_template("edit_file.html", file=file)
+@app.route("/download/<int:id>")
+def download(id):
+    f = FileUpload.query.get_or_404(id)
+    return send_from_directory(UPLOAD_FOLDER, f.filename, as_attachment=True)
+@app.route("/preview/<int:id>")
+
+def preview_file(id):
+    file = FileUpload.query.get_or_404(id)
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"],
+        file.filename,
+        as_attachment=False  
+    )
+@app.route("/delete-file/<int:id>", methods=["POST"])
+@admin_required
+def delete_file(id):
+    f = FileUpload.query.get_or_404(id)
+
+    path = os.path.join(UPLOAD_FOLDER, f.filename)
+    if os.path.exists(path):
+        os.remove(path)
+
+    db.session.delete(f)
     db.session.commit()
-    flash('File deleted successfully.', 'success')
-    return redirect(url_for('dashboard'))
+    flash("File deleted", "success")
+    return redirect(url_for("dashboard"))
 
+# ---------------- COLLABORATORS ----------------
+@app.route("/collaborators")
+def collaborators():
+    people = Collaborator.query.all()
+    return render_template("collaborators.html", people=people)
 
-@app.route('/logout')
-@login_required
-def logout():
-    session.pop('user_id', None)
-    flash('You have been logged out.', 'info')
-    return redirect(url_for('login'))
+@app.route("/add-collaborator", methods=["GET","POST"])
+@admin_required
+def add_collaborator():
+    if request.method == "POST":
+        db.session.add(Collaborator(
+            name=request.form["name"],
+            email=request.form["email"],
+            resume_url=request.form["resume"],
+            contribution=request.form["contribution"]
+        ))
+        db.session.commit()
+        flash("Collaborator added", "success")
+        return redirect(url_for("collaborators"))
 
-@app.route('/')
-def resources():
-    """Public Linktree-style view for a specific user."""
-    user = User.query.first()
-    links = user.links
-    files = user.files
-    return render_template('resources.html', links=links, files=files, username=user.username)
+    return render_template("add_collaborator.html")
 
-from flask import send_from_directory, abort
+@app.route("/edit-collaborator/<int:id>", methods=["GET","POST"])
+@admin_required
+def edit_collaborator(id):
+    c = Collaborator.query.get_or_404(id)
 
-# 🟢 Preview route — for iframe viewing
-@app.route('/preview/<int:file_id>')
-def preview_file(file_id):
-    file_record = FileUpload.query.get_or_404(file_id)
-    try:
-        return send_from_directory(app.config['UPLOAD_FOLDER'], file_record.filename, as_attachment=False)
-    except FileNotFoundError:
-        abort(404)
+    if request.method == "POST":
+        c.name = request.form["name"]
+        c.email = request.form["email"]
+        c.resume_url = request.form["resume"]
+        c.contribution = request.form["contribution"]
+        db.session.commit()
+        flash("Collaborator updated", "success")
+        return redirect(url_for("collaborators"))
 
-# 🔵 Download route — for download button
-@app.route('/public-download/<int:file_id>')
-def public_download(file_id):
-    file_record = FileUpload.query.get_or_404(file_id)
-    try:
-        return send_from_directory(app.config['UPLOAD_FOLDER'], file_record.filename, as_attachment=True)
-    except FileNotFoundError:
-        abort(404)
+    return render_template("edit_collaborator.html", collaborator=c)
 
-import hashlib
-print(hasattr(hashlib, 'scrypt'))
+@app.route("/delete-collaborator/<int:id>", methods=["POST"])
+@admin_required
+def delete_collaborator(id):
+    c = Collaborator.query.get_or_404(id)
+    db.session.delete(c)
+    db.session.commit()
+    flash("Collaborator deleted", "success")
+    return redirect(url_for("collaborators"))
 
-if __name__ == '__main__':
+def send_email(to, otp):
+    msg = EmailMessage()
+    msg["From"] = os.getenv("EMAIL_FROM")
+    msg["To"] = to
+    msg["Subject"] = "Eknal Technologies – Email Verification Code"
+   # msg.set_content(f"Your OTP for editing your profile is: {otp}")
+    msg.add_alternative(f"""
+<html>
+<body style="background-color:#f4f6fb; font-family: Arial, sans-serif; padding:30px;">
+
+  <div style="
+    max-width:480px;
+    margin:auto;
+    background:#ffffff;
+    border-radius:12px;
+    padding:30px;
+    box-shadow:0 4px 12px rgba(0,0,0,0.08);
+    text-align:center;
+  ">
+      
+    <!-- Logo -->
+   <img src="https://i.ibb.co/39ZNH1W0/eknal-link.png"
+         style="height:50px;margin-bottom:20px;"
+         alt="Eknal Link Logo"/>
+
+    <h2 style="color:#4f46e5; margin-bottom:10px;">
+      OTP Verification
+    </h2>
+
+    <p style="color:#555; font-size:15px;">
+      We received a request to update your collaborator profile.
+    </p>
+
+    <p style="color:#555; font-size:15px;">
+      Use the verification code below:
+    </p>
+
+    <div style="
+      font-size:28px;
+      font-weight:bold;
+      letter-spacing:6px;
+      background:#f0f2ff;
+      padding:15px;
+      border-radius:8px;
+      margin:20px 0;
+      color:#111;
+    ">
+      {otp}
+    </div>
+
+    <p style="color:#777; font-size:14px;">
+      This code is valid for 5 minutes.
+    </p>
+
+    <p style="color:#999; font-size:13px;">
+      If you did not request this, you can safely ignore this email.
+    </p>
+
+    <hr style="border:none;border-top:1px solid #eee;margin:25px 0;">
+
+    <p style="font-size:13px;color:#666;">
+      © Eknal Technologies
+    </p>
+
+  </div>
+
+</body>
+</html>
+""", subtype="html")
+    server = smtplib.SMTP("smtp.zoho.in", 587)
+    server.starttls()
+    server.login(
+        os.getenv("EMAIL_USER"),
+        os.getenv("EMAIL_PASS")
+    )
+    server.send_message(msg)
+    server.quit()
+def generate_otp():
+    return str(random.randint(100000, 999999))
+
+def save_otp(email, otp):
+    redis_client.setex(f"otp:{email}", 300, otp)
+
+def get_otp(email):
+    return redis_client.get(f"otp:{email}")
+
+def delete_otp(email):
+    redis_client.delete(f"otp:{email}")
+
+@app.route("/request-edit", methods=["GET", "POST"])
+def request_edit():
+    if request.method == "POST":
+        # from datetime import datetime
+        # datetime=datetime.now()
+        # print(datetime)
+        from time import perf_counter
+        start=perf_counter()
+        email = request.form["email"].strip()
+        
+
+        # 1) Empty check
+        if not email:
+            flash("Please enter your email address", "danger")
+            return redirect(url_for("request_edit"))
+
+    
+        # 3) Check in database
+        collaborator = Collaborator.query.filter_by(email=email).first()
+
+        if not collaborator:
+            flash("Email not found", "danger")
+            return redirect(url_for("request_edit"))
+
+        # 4) Generate + Send OTP
+        otp = generate_otp()
+        duration=perf_counter()-start
+        print(f"{duration:.4f} seconds 367")
+        start=perf_counter()
+        save_otp(email, otp)
+        duration=perf_counter()-start
+        print(f"{duration:.4f} seconds 371")
+        start=perf_counter()
+        
+        send_email(email, otp)
+        duration=perf_counter()-start
+        print(f"{duration:.4f} seconds 376")
+        session["otp_email"] = email
+        flash("Verification code sent to your email.", "success")
+        return redirect(url_for("verify_otp"))
+
+    return render_template("request_edit.html")
+@app.route("/verify-otp", methods=["GET", "POST"])
+def verify_otp():
+    if request.method == "POST":
+        user_otp = request.form["otp"]
+        email = session.get("otp_email")
+        if not email:
+            flash("Session expired", "danger")
+            return redirect(url_for("request_edit"))
+        saved_otp = redis_client.get(f"otp:{email}")
+
+        if saved_otp is None:
+            flash("OTP expired", "danger")
+            return redirect(url_for("request_edit"))
+
+        if user_otp == saved_otp:
+            redis_client.delete(f"otp:{email}")
+            session["verified_email"] = email
+            flash("OTP verified successfully.", "success")
+            return redirect(url_for("self_edit_collaborator"))
+
+        flash("Incorrect OTP. Please try again.", "danger")
+
+    return render_template("verify_otp.html")
+#edit
+@app.route("/self-edit", methods=["GET", "POST"])
+def self_edit_collaborator():
+    email = session.get("verified_email")
+
+    if not email:
+        flash("Unauthorized access", "danger")
+        return redirect(url_for("request_edit"))
+
+    collaborator = Collaborator.query.filter_by(email=email).first_or_404()
+
+    if request.method == "POST":
+        collaborator.name = request.form["name"]
+        collaborator.resume_url = request.form["resume"]
+        collaborator.contribution = request.form["contribution"]
+
+        db.session.commit()
+
+        session.pop("verified_email")
+        session.pop("otp_email", None)
+
+        flash("Your profile has been updated successfully.", "success")
+        return redirect(url_for("collaborators"))
+
+    return render_template("self_edit.html", collaborator=collaborator)
+
+# ---------------- RUN ----------------
+if __name__ == "__main__":
     with app.app_context():
         db.create_all()
-    debug_mode = True if os.getenv('FLASK_DEBUG', 'False').lower() == 'true' else False
-    app.run(debug=debug_mode, port=7800, host='0.0.0.0')
+    app.run(debug=True)

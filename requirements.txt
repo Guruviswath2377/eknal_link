@@ -1,0 +1,6 @@
+Flask
+Flask-SQLAlchemy
+redis
+python-dotenv
+requests
+beautifulsoup4

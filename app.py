@@ -5,18 +5,17 @@ from werkzeug.utils import secure_filename
 from functools import wraps
 from dotenv import load_dotenv
 load_dotenv()
-import os
 import redis
 import smtplib
 from email.message import EmailMessage
 from email.mime.text import MIMEText
 import random
-EMAIL_USER = os.getenv("EMAIL_USER")
-EMAIL_PASS = os.getenv("EMAIL_PASS")
-EMAIL_FROM = os.getenv("EMAIL_FROM")
+EMAIL_USER = os.getenv("EMAIL_USER", "test@example.com")
+EMAIL_PASS = os.getenv("EMAIL_PASS", "password")
+EMAIL_FROM = os.getenv("EMAIL_FROM", "test@example.com")
 
-REDIS_SERVER_NUMBER = os.getenv("REDIS_SERVER_NUMBER")
-REDIS_PORT_NUMBER = int(os.getenv("REDIS_PORT_NUMBER"))
+REDIS_SERVER_NUMBER = os.getenv("REDIS_SERVER_NUMBER", "localhost")
+REDIS_PORT_NUMBER = int(os.getenv("REDIS_PORT_NUMBER", 6379))
 REDIS_PASSWORD = os.getenv("REDIS_PASSWORD")
 
 redis_client = redis.Redis(
@@ -27,10 +26,10 @@ redis_client = redis.Redis(
 )
 # ---------------- APP ----------------
 app = Flask(__name__)
-app.config["SECRET_KEY"] = "super-secret-key"
+app.config["SECRET_KEY"] = os.getenv("SECRET_KEY", "dev-secret-key")
 app.config["SQLALCHEMY_DATABASE_URI"] = "sqlite:///data.db"
 app.config["SQLALCHEMY_TRACK_MODIFICATIONS"] = False
-
+app.config["MAX_CONTENT_LENGTH"] = 16 * 1024 * 1024
 UPLOAD_FOLDER = "uploads"
 ALLOWED_EXTENSIONS = {"txt", "pdf", "png", "jpg", "jpeg", "gif"}
 app.config["UPLOAD_FOLDER"] = UPLOAD_FOLDER
@@ -41,8 +40,8 @@ if not os.path.exists(UPLOAD_FOLDER):
 db = SQLAlchemy(app)
 
 # ---------------- ADMIN CREDENTIALS ----------------
-ADMIN_USERNAME = "admin"
-ADMIN_PASSWORD = "admin123"
+ADMIN_USERNAME = os.getenv("ADMIN_USERNAME", "admin")
+ADMIN_PASSWORD = os.getenv("ADMIN_PASSWORD", "admin123")
 
 # ---------------- MODELS ----------------
 class Link(db.Model):
@@ -154,7 +153,7 @@ def edit_link(id):
         flash("Link updated", "success")
         return redirect(url_for("dashboard"))
 
-    return render_template("edit_link.html", link=link)\
+    return render_template("edit_link.html", link=link)
 
 @app.route("/delete-link/<int:id>", methods=["POST"])
 @admin_required
@@ -170,7 +169,10 @@ def delete_link(id):
 @admin_required
 def add_file():
     if request.method == "POST":
-        file = request.files["file"]
+        file = request.files.get("file")
+        if not file:
+            flash("No file selected", "danger")
+            return redirect(url_for("add_file"))
 
         if not allowed_file(file.filename):
             flash("Invalid file type", "danger")
@@ -390,17 +392,14 @@ def request_edit():
 
         # 4) Generate + Send OTP
         otp = generate_otp()
-        duration=perf_counter()-start
-        print(f"{duration:.4f} seconds 367")
+        duration=perf_counter()-start 
         start=perf_counter()
         save_otp(email, otp)
         duration=perf_counter()-start
-        print(f"{duration:.4f} seconds 371")
         start=perf_counter()
         
         send_email(email, otp)
         duration=perf_counter()-start
-        print(f"{duration:.4f} seconds 376")
         session["otp_email"] = email
         flash("Verification code sent to your email.", "success")
         return redirect(url_for("verify_otp"))
@@ -414,14 +413,14 @@ def verify_otp():
         if not email:
             flash("Session expired", "danger")
             return redirect(url_for("request_edit"))
-        saved_otp = redis_client.get(f"otp:{email}")
+        saved_otp = get_otp(email)
 
         if saved_otp is None:
             flash("OTP expired", "danger")
             return redirect(url_for("request_edit"))
 
         if user_otp == saved_otp:
-            redis_client.delete(f"otp:{email}")
+            delete_otp(email)
             session["verified_email"] = email
             flash("OTP verified successfully.", "success")
             return redirect(url_for("self_edit_collaborator"))
